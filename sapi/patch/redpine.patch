@@ -1,0 +1,210 @@
+diff -ruN /common/rsi_common_apis.c /common/rsi_common_apis.c
+--- /common/rsi_common_apis.c	2023-04-12 08:34:43.723099899 +0200
++++ /common/rsi_common_apis.c	2023-04-14 13:42:21.872862996 +0200
+@@ -484,10 +484,6 @@
+     // Wait until receive card ready
+     rsi_scheduler(&rsi_driver_cb->scheduler_cb);
+ 
+-    if (rsi_timer_expired(&timer_instance)) {
+-      SL_PRINTF(SL_WIRELESS_INIT_CARD_READY_TIMEOUT, COMMON, LOG_ERROR);
+-      return RSI_ERROR_CARD_READY_TIMEOUT;
+-    }
+ #else
+ #ifndef RSI_COMMON_SEM_BITMAP
+     rsi_driver_cb_non_rom->common_wait_bitmap |= BIT(3);
+@@ -1715,7 +1715,7 @@
+  * @return      Void
+  */
+ 
+-void rsi_wireless_driver_task(void)
++void rsi_wireless_driver_task(void* params)
+ {
+   SL_PRINTF(SL_WIRELESS_DRIVER_TASK_ENTRY, COMMON, LOG_INFO);
+ #ifdef RSI_WITH_OS
+diff -ruN /common/rsi_device_init_apis.c /common/rsi_device_init_apis.c
+--- /common/rsi_device_init_apis.c	2023-04-12 08:34:43.723099899 +0200
++++ /common/rsi_device_init_apis.c	2023-04-25 17:34:23.515339399 +0200
+@@ -68,12 +68,6 @@
+     return RSI_ERROR_COMMAND_GIVEN_IN_WRONG_STATE;
+   }
+ 
+-#if defined(RSI_SPI_INTERFACE) || defined(RSI_M4_INTERFACE) || defined(RSI_UART_INTERFACE) \
+-  || defined(RSI_SDIO_INTERFACE)
+-  // Board Initialization
+-  rsi_hal_board_init();
+-#endif
+-
+ #ifdef RSI_M4_INTERFACE
+ 
+   SysTick_Config(SystemCoreClock / 1000);
+@@ -139,14 +133,6 @@
+   }
+ #endif
+ #else
+-#ifndef RSI_M4_INTERFACE
+-  // power cycle the module
+-  status = rsi_bl_module_power_cycle();
+-  if (status != RSI_SUCCESS) {
+-    SL_PRINTF(SL_DEVICE_INIT_MODULE_POWER_CYCLE_FAILURE, COMMON, LOG_ERROR, "status: %4x", status);
+-    return status;
+-  }
+-#endif
+ #if defined(RSI_SDIO_INTERFACE)
+   // SDIO interface initialization
+   status = rsi_sdio_iface_init();
+diff -ruN /driver/device_interface/uart/rsi_uart.c /driver/device_interface/uart/rsi_uart.c
+--- /driver/device_interface/uart/rsi_uart.c	2023-04-26 17:37:43.421039296 +0200
++++ /driver/device_interface/uart/rsi_uart.c	2023-04-25 17:36:01.339371354 +0200
+@@ -34,7 +34,8 @@
+ #ifdef RSI_UART_INTERFACE
+ #include "stm32f4xx_hal.h"
+ #include "stm32f4xx_hal_uart.h"
+-extern UART_HandleTypeDef huart1;
++#include "wrl_hw.h"
++extern UART_HandleTypeDef huart2;
+ 
+ #include <stdlib.h>
+ #include <stdio.h>
+@@ -60,7 +61,7 @@
+ 
+   memcpy(pkt_buffer, uart_rev_buf + 4, desired_len);
+ 
+-  return 0;
++  return WRL_HW_s16UartRxStatus;
+ }
+ 
+ /*==============================================*/
+@@ -72,10 +73,15 @@
+ 
+   // API to write packet to UART interface
+   retval = rsi_uart_send((uint8_t *)uFrameDscFrame, (size_param + RSI_FRAME_DESC_LEN));
+-  while (huart1.gState != HAL_UART_STATE_READY)
+-    ;
+-  while (huart1.TxXferCount != 0)
+-    ;
++  while(huart2.gState!=HAL_UART_STATE_READY)
++  {
++      vTaskDelay(1);
++  }
++
++  while (huart2.hdmatx->State != HAL_DMA_STATE_READY)
++  {
++      vTaskDelay(1);
++  }
+   return retval;
+ }
+ 
+@@ -89,16 +95,6 @@
+ 
+ int32_t rsi_uart_init(void)
+ {
+-  SL_PRINTF(SL_UART_INIT_ENTRY, DRIVER, LOG_INFO);
+-  huart1.Instance          = USART1;
+-  huart1.Init.BaudRate     = 921600;
+-  huart1.Init.WordLength   = UART_WORDLENGTH_8B;
+-  huart1.Init.StopBits     = UART_STOPBITS_1;
+-  huart1.Init.Parity       = UART_PARITY_NONE;
+-  huart1.Init.Mode         = UART_MODE_TX_RX;
+-  huart1.Init.HwFlowCtl    = UART_HWCONTROL_NONE;
+-  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+-  SL_PRINTF(SL_UART_INIT_EXIT, DRIVER, LOG_INFO);
+   return 0;
+ }
+ 
+diff -ruN /driver/rsi_driver_event_handlers.c /driver/rsi_driver_event_handlers.c
+--- /driver/rsi_driver_event_handlers.c	2023-04-12 08:34:43.727099898 +0200
++++ /driver/rsi_driver_event_handlers.c	2023-04-14 13:42:21.876862998 +0200
+@@ -33,6 +33,7 @@
+ #endif
+ #include "rsi_wlan_non_rom.h"
+ #include "rsi_sdio.h"
++#include "wrl_hw.h"
+ #include "rsi_pkt_mgmt.h"
+ 
+ // Sleep Ack frame
+@@ -846,7 +847,8 @@
+     rsi_driver_cb_non_rom->driver_rx_timer_start = 0;
+ #endif
+     SL_PRINTF(SL_RSI_ERROR_TIMEOUT_READ, BLUETOOTH, LOG_ERROR, "STATUS: %4x", status);
+-
++    /* Enable,- Start UART RX DMA to allow the module to send more frames (HW Control flow) */
++    wrl_RsiRxStartFrame ();
+     return;
+   }
+ 
+@@ -903,6 +905,8 @@
+       rsi_mutex_unlock(&rsi_driver_cb_non_rom->tx_mutex);
+     }
+ #endif
++    /* Enable,- Start UART RX DMA to allow the module to send more frames (HW Control flow) */
++    wrl_RsiRxStartFrame ();
+     return;
+ #endif
+   }
+@@ -1066,6 +1070,9 @@
+   }
+ #endif
+ 
++  /* Enable,- Start UART RX DMA to allow the module to send more frames (HW Control flow) */
++  wrl_RsiRxStartFrame ();
++
+   return;
+ }
+ /** @} */
+diff -ruN /include/rsi_common_apis.h /include/rsi_common_apis.h
+--- /include/rsi_common_apis.h	2023-04-12 08:34:43.731099897 +0200
++++ /include/rsi_common_apis.h	2023-04-14 13:42:21.884863001 +0200
+@@ -170,7 +170,7 @@
+ extern int32_t rsi_socket_config(void);
+ extern int32_t rsi_wireless_deinit(void);
+ extern int32_t rsi_common_get_status(void);
+-extern void rsi_wireless_driver_task(void);
++extern void rsi_wireless_driver_task(void* params);
+ extern int16_t rsi_check_assertion(void);
+ extern int32_t rsi_get_ram_log(uint32_t addr, uint32_t length);
+ extern int32_t rsi_driver_version(uint8_t *request);
+diff -ruN /include/rsi_data_types.h /include/rsi_data_types.h
+--- /include/rsi_data_types.h	2023-04-11 14:51:58.558484496 +0200
++++ /include/rsi_data_types.h	2023-04-25 17:36:42.535384810 +0200
+@@ -73,10 +73,6 @@
+ #endif
+ #endif
+ 
+-#ifndef RSI_M4_INTERFACE
+-#define STATIC static
+-#define INLINE inline
+-#endif
+ /******************************************************
+  * *                    Structures
+  * ******************************************************/
+diff -ruN /include/rsi_hal.h /include/rsi_hal.h
+--- /include/rsi_hal.h	2023-04-12 08:34:43.731099897 +0200
++++ /include/rsi_hal.h	2023-04-25 17:37:02.091391198 +0200
+@@ -132,8 +132,6 @@
+ void rsi_interrupt_handler(void);
+ void ABRD(void);
+ 
+-void Error_Handler(void);
+-
+ /* RTC Related API's */
+ uint32_t rsi_rtc_get_time(void);
+ int32_t rsi_rtc_set_time(uint32_t time);
+diff -ruN /include/rsi_wlan_apis.h /include/rsi_wlan_apis.h
+--- /include/rsi_wlan_apis.h	2023-04-11 14:51:58.562484494 +0200
++++ /include/rsi_wlan_apis.h	2023-04-14 13:42:21.884863001 +0200
+@@ -1783,12 +1783,12 @@
+                                                                          const uint32_t length));
+ 
+ void rsi_register_auto_config_rsp_handler(void (*rsi_auto_config_rsp_handler)(uint16_t status, uint8_t state));
+-STATIC INLINE void set_option(uint32_t *parameter, uint32_t flag)
++static inline void set_option(uint32_t *parameter, uint32_t flag)
+ {
+   *parameter |= flag;
+ }
+ 
+-STATIC INLINE void clear_option(uint32_t *parameter, uint32_t flag)
++static inline void clear_option(uint32_t *parameter, uint32_t flag)
+ {
+   *parameter &= ~flag;
+ }
+ 
